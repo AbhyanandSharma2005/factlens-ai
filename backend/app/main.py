@@ -91,15 +91,27 @@ def run_ingestion_pipeline(doc_id: str, file_path: str, filename: str):
                             (id_a, id_b, adj["relation_type"], adj["explanation"], adj.get("confidence", 1.0))
                         )
 
-            time.sleep(4)
+            # Commit progress after each page so a later crash/cancel doesn't lose
+            # already-extracted facts for this document.
+            conn.commit()
+            time.sleep(1)
 
         cur.execute("UPDATE documents SET status = 'ready', total_pages = %s WHERE id = %s", (total_pages, doc_id))
         conn.commit()
 
-    except Exception as e:
-        print(f"Pipeline Error: {e}")
-        cur.execute("UPDATE documents SET status = 'failed' WHERE id = %s", (doc_id,))
-        conn.commit()
+    except BaseException as e:
+        # BaseException (not just Exception) is intentional: asyncio.CancelledError
+        # inherits from BaseException in Python 3.8+, and a dev-server reload or
+        # request cancellation must still mark the document as failed instead of
+        # leaving it stuck at 'processing' forever.
+        print(f"Pipeline Error ({type(e).__name__}): {e}")
+        try:
+            cur.execute("UPDATE documents SET status = 'failed' WHERE id = %s", (doc_id,))
+            conn.commit()
+        except Exception as inner_e:
+            print(f"Failed to mark document as failed: {inner_e}")
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
     finally:
         if doc:
             doc.close()
@@ -129,6 +141,20 @@ async def upload_document(file: UploadFile, bg_tasks: BackgroundTasks):
 
     bg_tasks.add_task(run_ingestion_pipeline, doc_id, temp_path, file.filename)
     return {"document_id": doc_id, "status": "processing", "message": "Document is being analyzed."}
+
+
+@app.get("/api/documents/{doc_id}/retry")
+async def retry_document(doc_id: str, bg_tasks: BackgroundTasks):
+    """Re-run a document that got stuck or marked failed (e.g. from a rate-limit storm)."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT filename FROM documents WHERE id = %s", (doc_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    raise HTTPException(status_code=501, detail="Retry requires the original file; re-upload instead.")
 
 
 @app.get("/api/facts")
