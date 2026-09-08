@@ -12,7 +12,7 @@ from groq import Groq
 from pydantic import BaseModel, Field, ValidationError
 from fastembed import TextEmbedding
 
-from app.rate_limiter import groq_rate_limiter, is_rate_limit_error, backoff_delay
+from app.rate_limiter import groq_rate_limiter, is_rate_limit_error, is_retryable_error, backoff_delay
 
 print("Loading Embedding Model...")
 embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
@@ -70,10 +70,38 @@ def has_quantifiable_content(item: ExtractedFact) -> bool:
     return bool(re.search(r'\d', item.metric_value.raw_value)) or bool(re.search(r'\d', item.evidence_text))
 
 
+def _normalize_for_match(s: str) -> str:
+    """
+    Normalize text before the verbatim-substring hallucination check.
+
+    PyMuPDF's extracted text and the LLM's JSON output can differ in ways that
+    are semantically identical but byte-different: curly vs straight quotes,
+    en/em dashes vs hyphens, non-breaking spaces. Without this, a single
+    mismatched character anywhere in the quote fails the whole substring
+    match and produces a false "hallucination" rejection on text the model
+    actually copied correctly. Whitespace is still collapsed at the end so
+    line-wrap differences don't matter either.
+    """
+    if not s:
+        return ""
+    s = s.replace('\u2018', "'").replace('\u2019', "'")   # curly single quotes
+    s = s.replace('\u201c', '"').replace('\u201d', '"')   # curly double quotes
+    s = s.replace('\u2013', '-').replace('\u2014', '-')   # en dash / em dash
+    s = s.replace('\u00a0', ' ')                            # non-breaking space
+    s = s.replace('\ufb01', 'fi').replace('\ufb02', 'fl')  # common ligatures
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
+
+
 def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
     """
     Shared call path: acquires the process-wide rate-limit slot before every
     request, and applies exponential backoff (longer specifically for 429s).
+
+    Only retries errors classified as retryable (rate limits, transient
+    server/network issues). Deterministic failures like a 400
+    json_validate_failed fail immediately instead of replaying the same
+    failure 5 times at exponential backoff cost.
     """
     for attempt in range(max_retries):
         try:
@@ -86,6 +114,10 @@ def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
                 )
             return response
         except Exception as e:
+            if not is_retryable_error(e):
+                print(f"❌ Non-retryable error, failing fast: {type(e).__name__}: {e}")
+                return None
+
             rate_limited = is_rate_limit_error(e)
             delay = backoff_delay(attempt, rate_limited)
             reason = "rate limit" if rate_limited else "API error"
@@ -172,8 +204,8 @@ PAGE TEXT:
 
     for item in parsed.facts:
         ev_text = item.evidence_text.strip()
-        clean_ev = re.sub(r'\s+', ' ', ev_text)
-        clean_doc = re.sub(r'\s+', ' ', text)
+        clean_ev = _normalize_for_match(ev_text)
+        clean_doc = _normalize_for_match(text)
 
         if not clean_ev or clean_ev not in clean_doc:
             print(f"❌ REJECTED (hallucination — evidence not found verbatim): {ev_text[:50]}...")
