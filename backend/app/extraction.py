@@ -12,6 +12,8 @@ from google import genai
 from google.genai import types
 from fastembed import TextEmbedding
 
+from app.rate_limiter import gemini_rate_limiter, is_rate_limit_error, backoff_delay
+
 # 1. Initialize the local embedding model (Runs free on CPU)
 print("Loading Embedding Model...")
 embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
@@ -55,8 +57,7 @@ EXTRACTION_SCHEMA = {
 def looks_like_toc_or_cover(text: str) -> bool:
     """
     Cheap structural heuristic to skip table-of-contents, cover, and divider pages
-    before spending an LLM call on them. These pages are mostly short lines
-    (titles/headings) with very few lines that contain real data.
+    before spending an LLM call on them.
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if not lines:
@@ -66,7 +67,6 @@ def looks_like_toc_or_cover(text: str) -> bool:
     digit_lines = sum(1 for l in lines if any(c.isdigit() for c in l))
     digit_line_ratio = digit_lines / len(lines)
 
-    # TOC/cover pages: dominated by short heading-like lines, very few lines with numbers
     return short_line_ratio > 0.8 and digit_line_ratio < 0.3
 
 
@@ -78,6 +78,38 @@ def has_quantifiable_content(item: dict) -> bool:
     raw_val = item.get("metric_value", {}).get("raw_value", "") or ""
     evidence = item.get("evidence_text", "") or ""
     return bool(re.search(r'\d', raw_val)) or bool(re.search(r'\d', evidence))
+
+
+def _call_gemini_with_backoff(prompt: str, schema: dict, max_retries: int = 5):
+    """
+    Shared call path: acquires the process-wide rate-limit slot before every
+    request (so concurrent document pipelines don't collide), and applies
+    exponential backoff with a much longer wait specifically for rate-limit
+    errors (429/RESOURCE_EXHAUSTED) vs. transient/network errors.
+    """
+    for attempt in range(max_retries):
+        try:
+            with gemini_rate_limiter:
+                response = client.models.generate_content(
+                    model='gemini-3.6-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=schema,
+                        temperature=0.0
+                    )
+                )
+            return response
+        except Exception as e:
+            rate_limited = is_rate_limit_error(e)
+            delay = backoff_delay(attempt, rate_limited)
+            reason = "rate limit" if rate_limited else "API error"
+            print(f"⚠️ Gemini {reason} (attempt {attempt + 1}/{max_retries}). Backing off {delay:.1f}s...")
+            time.sleep(delay)
+            if attempt == max_retries - 1:
+                print(f"❌ Giving up after {max_retries} attempts: {e}")
+                return None
+    return None
 
 
 def process_pdf_page(pdf_path: str, page_num: int):
@@ -115,30 +147,10 @@ PAGE TEXT:
 {text}
 """
 
-    # --- RETRY LOGIC ---
-    response = None
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model='gemini-3.6-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=EXTRACTION_SCHEMA,
-                    temperature=0.0
-                )
-            )
-            break  # Success! Break out of the retry loop.
-        except Exception as e:
-            print(f"⚠️ API Overloaded (Attempt {attempt + 1}/{max_retries}). Retrying in 5 seconds...")
-            time.sleep(5)
-            if attempt == max_retries - 1:
-                print("Skipping page due to persistent API errors.")
-                return []
-    # -------------------
+    response = _call_gemini_with_backoff(prompt, EXTRACTION_SCHEMA)
 
     if not response or not response.text:
+        print(f"Skipping page {page_num} due to persistent API errors.")
         return []
 
     try:
