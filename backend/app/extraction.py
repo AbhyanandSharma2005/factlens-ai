@@ -66,16 +66,32 @@ def process_pdf_page(pdf_path: str, page_num: int):
     {text}
     """
     
-    response = client.models.generate_content(
-        model='gemini-3.6-flash',
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=EXTRACTION_SCHEMA,
-            temperature=0.0
-        )
-    )
+    # --- RETRY LOGIC ---
+    response = None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=EXTRACTION_SCHEMA,
+                    temperature=0.0
+                )
+            )
+            break  # Success! Break out of the retry loop.
+        except Exception as e:
+            print(f"⚠️ API Overloaded (Attempt {attempt + 1}/{max_retries}). Retrying in 5 seconds...")
+            time.sleep(5)
+            if attempt == max_retries - 1:
+                print("Skipping page due to persistent API errors.")
+                return []
+    # -------------------
     
+    if not response or not response.text:
+        return []
+
     try:
         raw_facts = json.loads(response.text)
     except Exception as e:
