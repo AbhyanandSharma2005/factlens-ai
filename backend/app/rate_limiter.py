@@ -49,6 +49,34 @@ def is_rate_limit_error(exc: Exception) -> bool:
     return "RATE_LIMIT" in msg or "429" in msg or "QUOTA" in msg or "TOO MANY REQUESTS" in msg
 
 
+def is_retryable_error(exc: Exception) -> bool:
+    """
+    Only retry errors that have a real chance of succeeding on a second attempt.
+
+    Rate limits (429) and transient server-side/network issues are worth waiting
+    out. A 400 (e.g. Groq's json_validate_failed) is a deterministic failure for
+    that exact prompt+page combination -- retrying it just replays the same
+    failure 5 times at exponential backoff cost, for nothing.
+    """
+    msg = str(exc).upper()
+
+    if is_rate_limit_error(exc):
+        return True
+
+    # Transient / server-side -- worth a retry
+    if any(code in msg for code in ("500", "502", "503", "504", "TIMEOUT", "CONNECTION")):
+        return True
+
+    # Deterministic client-side failures (bad request, schema/validation failures,
+    # auth, not-found, etc.) -- retrying changes nothing, fail fast instead.
+    if any(code in msg for code in ("400", "401", "403", "404", "JSON_VALIDATE_FAILED", "INVALID_REQUEST")):
+        return False
+
+    # Unknown error shape: default to retryable so we don't silently swallow
+    # something that genuinely might be transient (e.g. a new SDK exception type).
+    return True
+
+
 def backoff_delay(attempt: int, is_rate_limit: bool) -> float:
     """
     Exponential backoff with jitter. Rate-limit errors get a longer base delay
