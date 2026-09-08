@@ -52,6 +52,37 @@ class ExtractionResponse(BaseModel):
     facts: List[ExtractedFact] = Field(default_factory=list)
 
 
+def _parse_facts_resilient(raw_content: str, page_num: int) -> List[ExtractedFact]:
+    """
+    Validate each fact in the response individually instead of as one batch.
+
+    Groq's JSON mode guarantees syntactically valid JSON, but not that every
+    item matches our schema. Validating the whole `facts` list as a single
+    Pydantic model means one malformed item (e.g. a missing evidence_text)
+    throws out every other -- otherwise valid -- fact on the page. Since a
+    page can easily produce 3-5 facts, that's real extracted data lost over
+    one bad item. This validates fact-by-fact and keeps the good ones.
+    """
+    try:
+        raw = json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        print(f"❌ Could not parse Groq response on page {page_num} as JSON: {e}")
+        return []
+
+    raw_facts = raw.get("facts", []) if isinstance(raw, dict) else []
+    if not isinstance(raw_facts, list):
+        return []
+
+    good_facts = []
+    for i, item in enumerate(raw_facts):
+        try:
+            good_facts.append(ExtractedFact.model_validate(item))
+        except ValidationError as e:
+            print(f"⚠️ Dropping malformed fact #{i} on page {page_num} (kept the rest): {e}")
+
+    return good_facts
+
+
 def looks_like_toc_or_cover(text: str) -> bool:
     """Cheap structural heuristic to skip TOC/cover/divider pages before an LLM call."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -111,6 +142,12 @@ def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
                     messages=[{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"},
                     temperature=0.0,
+                    # Dense table-heavy pages can produce enough facts that the
+                    # response gets cut off mid-JSON before it's valid (seen as
+                    # "max completion tokens reached before generating a valid
+                    # document"). Set an explicit, generous ceiling instead of
+                    # relying on the model/provider default.
+                    max_tokens=4096,
                 )
             return response
         except Exception as e:
@@ -188,21 +225,11 @@ PAGE TEXT:
         return []
 
     raw_content = response.choices[0].message.content
-
-    try:
-        parsed = ExtractionResponse.model_validate_json(raw_content)
-    except (ValidationError, json.JSONDecodeError) as e:
-        print(f"⚠️ Schema validation failed on page {page_num}, attempting loose parse: {e}")
-        try:
-            loose = json.loads(raw_content)
-            parsed = ExtractionResponse.model_validate(loose)
-        except Exception as e2:
-            print(f"❌ Could not parse Groq response on page {page_num}: {e2}")
-            return []
+    facts = _parse_facts_resilient(raw_content, page_num)
 
     verified_facts = []
 
-    for item in parsed.facts:
+    for item in facts:
         ev_text = item.evidence_text.strip()
         clean_ev = _normalize_for_match(ev_text)
         clean_doc = _normalize_for_match(text)
