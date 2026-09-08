@@ -9,7 +9,7 @@ load_dotenv()
 from groq import Groq
 from pydantic import BaseModel, ValidationError
 
-from app.rate_limiter import groq_rate_limiter, is_rate_limit_error, backoff_delay
+from app.rate_limiter import groq_rate_limiter, is_rate_limit_error, is_retryable_error, backoff_delay
 
 api_key = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -102,6 +102,10 @@ def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) ->
                 )
             break
         except Exception as e:
+            if not is_retryable_error(e):
+                print(f"❌ Reconciler non-retryable error, failing fast: {type(e).__name__}: {e}")
+                return _fallback_result("Skipped: deterministic API error (e.g. schema/validation failure).")
+
             rate_limited = is_rate_limit_error(e)
             delay = backoff_delay(attempt, rate_limited)
             reason = "rate limit" if rate_limited else "API error"
