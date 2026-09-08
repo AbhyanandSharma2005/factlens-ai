@@ -1,19 +1,28 @@
 import os
 import json
 import re
-import fitz  # PyMuPDF
+from dotenv import load_dotenv
+
+# Load .env before initializing any client
+load_dotenv()
+
+import pymupdf as fitz  # Cleans up the deprecation warning
 from google import genai
 from google.genai import types
 from fastembed import TextEmbedding
 
-# 1. Initialize the local embedding model (Runs free on your CPU)
+# 1. Initialize the local embedding model (Runs free on CPU)
 print("Loading Embedding Model...")
 embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-# 2. Initialize Gemini Client (Pulls from your .env automatically)
-client = genai.Client()
+# 2. Explicitly pass the API key to the client
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY is missing from backend/.env! Please add it.")
 
-# 3. The strict JSON schema we force Gemini to return
+client = genai.Client(api_key=api_key)
+
+# 3. Schema for strict fact extraction
 EXTRACTION_SCHEMA = {
     "type": "ARRAY",
     "items": {
@@ -26,6 +35,7 @@ EXTRACTION_SCHEMA = {
                 "properties": {
                     "raw_value": {"type": "STRING", "description": "The exact number or metric"}
                 },
+                "required": ["raw_value"]
             },
             "scope_context": {
                 "type": "OBJECT",
@@ -45,7 +55,6 @@ def process_pdf_page(pdf_path: str, page_num: int):
     page = doc[page_num - 1]
     text = page.get_text("text")
     
-    # Skip empty or boilerplate pages (like covers)
     if len(text.strip()) < 100:
         return []
 
@@ -56,14 +65,13 @@ def process_pdf_page(pdf_path: str, page_num: int):
     {text}
     """
     
-    # Call Gemini 1.5 Flash
     response = client.models.generate_content(
         model='gemini-1.5-flash',
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=EXTRACTION_SCHEMA,
-            temperature=0.0  # Zero temp ensures factual, non-creative extraction
+            temperature=0.0
         )
     )
     
@@ -75,20 +83,15 @@ def process_pdf_page(pdf_path: str, page_num: int):
 
     verified_facts = []
     
-    # 4. Anti-Hallucination & Bounding Box Logic
     for item in raw_facts:
         ev_text = item.get("evidence_text", "").strip()
-        
-        # Clean up invisible newlines so we can match it perfectly
         clean_ev = re.sub(r'\s+', ' ', ev_text)
         clean_doc = re.sub(r'\s+', ' ', text)
         
         if clean_ev and clean_ev in clean_doc:
-            # Find the coordinates of the text to draw a highlight box in the React UI later
-            rects = page.search_for(ev_text[:50]) 
+            rects = page.search_for(ev_text[:50])
             bbox = [rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1] if rects else None
             
-            # Create the AI embedding vector for semantic search
             embed_repr = f"{item['subject']} | {item['fact_type']} | {item['metric_value'].get('raw_value', '')}"
             vector = list(embed_model.embed([embed_repr]))[0].tolist()
             
@@ -97,7 +100,6 @@ def process_pdf_page(pdf_path: str, page_num: int):
             item["embedding"] = vector
             verified_facts.append(item)
         else:
-            # If Gemini hallucinates or paraphrases the quote, we reject it!
             print(f"❌ REJECTED (Hallucination detected): {ev_text[:50]}...")
 
     return verified_facts
