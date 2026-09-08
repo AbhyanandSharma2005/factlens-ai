@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 python-multipart
-google-genai
+groq
 fastembed
 psycopg2-binary
 pymupdf
