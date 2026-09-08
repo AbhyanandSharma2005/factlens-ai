@@ -6,32 +6,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from google import genai
-from google.genai import types
+from groq import Groq
+from pydantic import BaseModel, ValidationError
 
-from app.rate_limiter import gemini_rate_limiter, is_rate_limit_error, backoff_delay
+from app.rate_limiter import groq_rate_limiter, is_rate_limit_error, backoff_delay
 
-api_key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=api_key)
+api_key = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+client = Groq(api_key=api_key)
 
-ADJUDICATION_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "relation_type": {
-            "type": "STRING",
-            "description": "Must be exactly one of: 'corroborates', 'contradicts', 'reconciled_by_context', 'insufficient_evidence'"
-        },
-        "explanation": {
-            "type": "STRING",
-            "description": "Concise explanation of why this relationship holds. If reconciled, state exactly what contextual difference explains the gap."
-        },
-        "confidence": {
-            "type": "NUMBER",
-            "description": "Confidence score between 0.0 and 1.0"
-        }
-    },
-    "required": ["relation_type", "explanation", "confidence"]
-}
+
+class AdjudicationResult(BaseModel):
+    relation_type: str  # corroborates | contradicts | reconciled_by_context | insufficient_evidence
+    explanation: str
+    confidence: float = 0.5
+
+
+VALID_RELATION_TYPES = {"corroborates", "contradicts", "reconciled_by_context", "insufficient_evidence"}
 
 
 def _normalize(s: str) -> str:
@@ -54,13 +45,16 @@ def is_near_identical(text_a: str, text_b: str) -> bool:
     return False
 
 
+def _fallback_result(reason: str) -> dict:
+    return {"relation_type": "insufficient_evidence", "explanation": reason, "confidence": 0.0}
+
+
 def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) -> dict:
     if is_near_identical(fact1.get("evidence_text", ""), fact2.get("evidence_text", "")):
-        return {
-            "relation_type": "insufficient_evidence",
-            "explanation": "Skipped: evidence text is structurally near-identical (likely a duplicate heading/section reference, not a comparable fact).",
-            "confidence": 0.0
-        }
+        return _fallback_result(
+            "Skipped: evidence text is structurally near-identical (likely a duplicate "
+            "heading/section reference, not a comparable fact)."
+        )
 
     prompt = f"""You are an expert financial and economic adjudicator.
     Compare these two extracted facts from different documents to see if they relate to each other.
@@ -86,20 +80,25 @@ def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) ->
     4. "insufficient_evidence": The facts are completely unrelated or cannot be logically compared.
 
     Analyze carefully and provide an explanation.
+
+    Respond ONLY with a JSON object of this exact shape:
+    {{
+      "relation_type": "one of: corroborates, contradicts, reconciled_by_context, insufficient_evidence",
+      "explanation": "concise explanation; if reconciled, state exactly what contextual difference explains the gap",
+      "confidence": 0.0
+    }}
     """
 
     max_retries = 5
+    response = None
     for attempt in range(max_retries):
         try:
-            with gemini_rate_limiter:
-                response = client.models.generate_content(
-                    model='gemini-3.6-flash',
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=ADJUDICATION_SCHEMA,
-                        temperature=0.0
-                    )
+            with groq_rate_limiter:
+                response = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
                 )
             break
         except Exception as e:
@@ -109,18 +108,21 @@ def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) ->
             print(f"⚠️ Reconciler {reason} (attempt {attempt + 1}/{max_retries}). Backing off {delay:.1f}s...")
             time.sleep(delay)
             if attempt == max_retries - 1:
-                return {
-                    "relation_type": "insufficient_evidence",
-                    "explanation": "Failed due to persistent API limits.",
-                    "confidence": 0.0
-                }
+                return _fallback_result("Failed due to persistent API limits.")
+
+    if not response or not response.choices:
+        return _fallback_result("Empty response from Groq.")
+
+    raw_content = response.choices[0].message.content
 
     try:
-        return json.loads(response.text)
-    except Exception as e:
-        print(f"Adjudication Parsing Error: {e}")
-        return {
-            "relation_type": "insufficient_evidence",
-            "explanation": "Failed to parse LLM response.",
-            "confidence": 0.0
-        }
+        result = AdjudicationResult.model_validate_json(raw_content)
+    except (ValidationError, json.JSONDecodeError) as e:
+        print(f"Adjudication schema validation failed: {e}")
+        return _fallback_result("Failed to validate LLM response against expected schema.")
+
+    if result.relation_type not in VALID_RELATION_TYPES:
+        print(f"⚠️ Unexpected relation_type from model: {result.relation_type}")
+        return _fallback_result(f"Model returned unrecognized relation_type: {result.relation_type}")
+
+    return result.model_dump()
