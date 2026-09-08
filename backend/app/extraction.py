@@ -89,7 +89,8 @@ def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
             rate_limited = is_rate_limit_error(e)
             delay = backoff_delay(attempt, rate_limited)
             reason = "rate limit" if rate_limited else "API error"
-            print(f"⚠️ Groq {reason} (attempt {attempt + 1}/{max_retries}). Backing off {delay:.1f}s...")
+            print(f"⚠️ Groq {reason} (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+            print(f"   Backing off {delay:.1f}s...")
             time.sleep(delay)
             if attempt == max_retries - 1:
                 print(f"❌ Giving up after {max_retries} attempts: {e}")
