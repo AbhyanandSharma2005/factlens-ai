@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 import shutil
 import uuid
 import os
@@ -30,7 +31,12 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
-def run_ingestion_pipeline(doc_id: str, file_path: str, filename: str):
+def run_ingestion_pipeline(doc_id: str, file_path: str, filename: str, max_pages: Optional[int] = None):
+    """
+    max_pages: optional cap on how many pages to process, for cheap dev-testing
+    iterations without burning quota re-processing the full document every time.
+    Leave as None (or omit) for a real/final run to process every page.
+    """
     import fitz
     conn = get_db()
     cur = conn.cursor()
@@ -39,9 +45,13 @@ def run_ingestion_pipeline(doc_id: str, file_path: str, filename: str):
     try:
         doc = fitz.open(file_path)
         total_pages = len(doc)
+        pages_to_process = min(total_pages, max_pages) if max_pages else total_pages
 
-        for page_idx in range(1, total_pages + 1):
-            print(f"Processing {filename} - Page {page_idx}/{total_pages}...")
+        if max_pages:
+            print(f"⚠️  Dev mode: capping at {pages_to_process}/{total_pages} pages")
+
+        for page_idx in range(1, pages_to_process + 1):
+            print(f"Processing {filename} - Page {page_idx}/{pages_to_process}...")
 
             page_facts = process_pdf_page(file_path, page_idx)
 
@@ -49,10 +59,10 @@ def run_ingestion_pipeline(doc_id: str, file_path: str, filename: str):
                 cur.execute(
                     """INSERT INTO facts (document_id, subject, fact_type, metric_value, scope_context, 
                        qualifiers, evidence_page, evidence_text, evidence_bbox, confidence, embedding)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector) RETURNING id""",
                     (doc_id, f["subject"], f["fact_type"], json.dumps(f["metric_value"]),
                      json.dumps(f["scope_context"]), f.get("qualifiers", []), f["evidence_page"],
-                     f["evidence_text"], json.dumps(f["evidence_bbox"]), f["confidence"], f["embedding"])
+                     f["evidence_text"], json.dumps(f["evidence_bbox"]), f["confidence"], str(f["embedding"]))
                 )
                 fact_id = cur.fetchone()["id"]
 
@@ -63,7 +73,7 @@ def run_ingestion_pipeline(doc_id: str, file_path: str, filename: str):
                        JOIN documents d ON f.document_id = d.id 
                        WHERE f.document_id != %s AND (f.embedding <=> %s::vector) < 0.28 
                        LIMIT 3""",
-                    (doc_id, f["embedding"])
+                    (doc_id, str(f["embedding"]))
                 )
                 candidates = cur.fetchall()
 
@@ -96,7 +106,10 @@ def run_ingestion_pipeline(doc_id: str, file_path: str, filename: str):
             conn.commit()
             time.sleep(1)
 
-        cur.execute("UPDATE documents SET status = 'ready', total_pages = %s WHERE id = %s", (total_pages, doc_id))
+        # If we intentionally capped pages, don't mark the doc "ready" as if it's
+        # complete -- that would be misleading in the UI. Leave it processing/partial.
+        final_status = "ready" if not max_pages or pages_to_process == total_pages else "partial"
+        cur.execute("UPDATE documents SET status = %s, total_pages = %s WHERE id = %s", (final_status, total_pages, doc_id))
         conn.commit()
 
     except BaseException as e:
@@ -125,7 +138,12 @@ def run_ingestion_pipeline(doc_id: str, file_path: str, filename: str):
 
 
 @app.post("/api/documents")
-async def upload_document(file: UploadFile, bg_tasks: BackgroundTasks):
+async def upload_document(file: UploadFile, bg_tasks: BackgroundTasks, max_pages: Optional[int] = None):
+    """
+    max_pages (optional query param): cap pages processed, e.g.
+    POST /api/documents?max_pages=15 for cheap dev-testing iterations.
+    Omit for a full/final run.
+    """
     doc_id = str(uuid.uuid4())
     os.makedirs("/tmp/factlens", exist_ok=True)
     temp_path = f"/tmp/factlens/{doc_id}_{file.filename}"
@@ -139,8 +157,8 @@ async def upload_document(file: UploadFile, bg_tasks: BackgroundTasks):
     cur.close()
     conn.close()
 
-    bg_tasks.add_task(run_ingestion_pipeline, doc_id, temp_path, file.filename)
-    return {"document_id": doc_id, "status": "processing", "message": "Document is being analyzed."}
+    bg_tasks.add_task(run_ingestion_pipeline, doc_id, temp_path, file.filename, max_pages)
+    return {"document_id": doc_id, "status": "processing", "message": "Document is being analyzed.", "max_pages": max_pages}
 
 
 @app.get("/api/documents/{doc_id}/retry")
@@ -155,6 +173,21 @@ async def retry_document(doc_id: str, bg_tasks: BackgroundTasks):
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")
     raise HTTPException(status_code=501, detail="Retry requires the original file; re-upload instead.")
+
+
+@app.get("/api/documents")
+async def list_documents():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, filename, status, total_pages, created_at
+        FROM documents
+        ORDER BY created_at DESC
+    """)
+    docs = cur.fetchall()
+    cur.close()
+    conn.close()
+    return docs
 
 
 @app.get("/api/facts")
