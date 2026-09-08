@@ -1,11 +1,15 @@
+import os
 import json
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from google import genai
 from google.genai import types
 
-# Initialize Gemini Client (Uses the API key from your .env)
-client = genai.Client()
+api_key = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=api_key)
 
-# Force Gemini to return exactly what we need for the database
 ADJUDICATION_SCHEMA = {
     "type": "OBJECT",
     "properties": {
@@ -15,7 +19,7 @@ ADJUDICATION_SCHEMA = {
         },
         "explanation": {
             "type": "STRING",
-            "description": "Concise explanation of why this relationship holds. If reconciled, state exactly what contextual difference (like time period or unit) explains the gap."
+            "description": "Concise explanation of why this relationship holds. If reconciled, state exactly what contextual difference explains the gap."
         },
         "confidence": {
             "type": "NUMBER",
@@ -52,14 +56,13 @@ def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) ->
     Analyze carefully and provide an explanation.
     """
     
-    # Call Gemini 1.5 Flash
     response = client.models.generate_content(
         model='gemini-1.5-flash',
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=ADJUDICATION_SCHEMA,
-            temperature=0.0 # Zero temp keeps the logic deterministic and strict
+            temperature=0.0
         )
     )
     
