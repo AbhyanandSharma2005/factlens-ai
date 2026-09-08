@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+google-genai
+fastembed
+psycopg2-binary
+pymupdf
+python-dotenv
