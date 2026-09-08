@@ -9,6 +9,8 @@ load_dotenv()
 from google import genai
 from google.genai import types
 
+from app.rate_limiter import gemini_rate_limiter, is_rate_limit_error, backoff_delay
+
 api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=api_key)
 
@@ -39,15 +41,13 @@ def _normalize(s: str) -> str:
 def is_near_identical(text_a: str, text_b: str) -> bool:
     """
     Detects structural duplicates (e.g. a TOC entry and its matching chapter-start
-    heading, or the same sentence re-extracted from an adjacent/overlapping chunk)
-    that aren't genuine cross-document facts worth adjudicating.
+    heading) that aren't genuine cross-document facts worth adjudicating.
     """
     norm_a, norm_b = _normalize(text_a), _normalize(text_b)
     if not norm_a or not norm_b:
         return False
     if norm_a == norm_b:
         return True
-    # one fully contains the other (common with heading vs. heading+number variants)
     shorter, longer = (norm_a, norm_b) if len(norm_a) <= len(norm_b) else (norm_b, norm_a)
     if len(shorter) > 8 and shorter in longer:
         return True
@@ -55,8 +55,6 @@ def is_near_identical(text_a: str, text_b: str) -> bool:
 
 
 def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) -> dict:
-    # Guard: skip near-identical evidence text before spending an LLM call —
-    # this is a structural duplicate, not a fact relationship.
     if is_near_identical(fact1.get("evidence_text", ""), fact2.get("evidence_text", "")):
         return {
             "relation_type": "insufficient_evidence",
@@ -90,23 +88,26 @@ def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) ->
     Analyze carefully and provide an explanation.
     """
 
-    response = None
-    max_retries = 3
+    max_retries = 5
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model='gemini-3.6-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ADJUDICATION_SCHEMA,
-                    temperature=0.0
+            with gemini_rate_limiter:
+                response = client.models.generate_content(
+                    model='gemini-3.6-flash',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ADJUDICATION_SCHEMA,
+                        temperature=0.0
+                    )
                 )
-            )
             break
         except Exception as e:
-            print(f"⚠️ Reconciler API Overloaded (Attempt {attempt + 1}/{max_retries}). Retrying in 5 seconds...")
-            time.sleep(5)
+            rate_limited = is_rate_limit_error(e)
+            delay = backoff_delay(attempt, rate_limited)
+            reason = "rate limit" if rate_limited else "API error"
+            print(f"⚠️ Reconciler {reason} (attempt {attempt + 1}/{max_retries}). Backing off {delay:.1f}s...")
+            time.sleep(delay)
             if attempt == max_retries - 1:
                 return {
                     "relation_type": "insufficient_evidence",
