@@ -4,13 +4,16 @@ import time
 
 class RateLimiter:
     """
-    Process-wide throttle shared by every Gemini call (extraction + reconciliation).
+    Process-wide throttle shared by every Groq call (extraction + reconciliation).
     Ensures that no matter how many documents are being ingested concurrently,
-    actual API calls are serialized and spaced apart — this is what actually
-    prevents 429/RESOURCE_EXHAUSTED errors, rather than retrying after the fact.
+    actual API calls are serialized and spaced apart.
+
+    Groq free tier: 30 requests/minute, 14,400 requests/day (org-wide, shared
+    across all models). A 2.2s floor keeps you safely under 30 RPM (27/min)
+    with headroom for retries.
     """
 
-    def __init__(self, min_interval_seconds: float = 6.0, max_concurrent: int = 1):
+    def __init__(self, min_interval_seconds: float = 2.2, max_concurrent: int = 1):
         self._slot = threading.Semaphore(max_concurrent)
         self._min_interval = min_interval_seconds
         self._timing_lock = threading.Lock()
@@ -37,25 +40,22 @@ class RateLimiter:
 
 
 # Single shared instance imported by both extraction.py and reconciler.py.
-# Tune min_interval_seconds up if you're still seeing 429s — this is a floor,
-# not a target: e.g. 6.0 = max ~10 requests/minute across the whole app.
-gemini_rate_limiter = RateLimiter(min_interval_seconds=6.0, max_concurrent=1)
+groq_rate_limiter = RateLimiter(min_interval_seconds=2.2, max_concurrent=1)
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
-    """Heuristic check since the SDK doesn't always expose a clean status code."""
+    """Heuristic check across providers' differing error message formats."""
     msg = str(exc).upper()
-    return "RESOURCE_EXHAUSTED" in msg or "429" in msg or "QUOTA" in msg or "RATE" in msg
+    return "RATE_LIMIT" in msg or "429" in msg or "QUOTA" in msg or "TOO MANY REQUESTS" in msg
 
 
 def backoff_delay(attempt: int, is_rate_limit: bool) -> float:
     """
-    Exponential backoff with jitter. Rate-limit errors get a much longer base
-    delay than transient/network errors, since retrying quickly just burns
-    more of the same quota window.
+    Exponential backoff with jitter. Rate-limit errors get a longer base delay
+    than transient/network errors.
     """
     import random
-    base = 20.0 if is_rate_limit else 3.0
+    base = 15.0 if is_rate_limit else 3.0
     delay = base * (2 ** attempt)
     jitter = random.uniform(0, base * 0.5)
-    return min(delay + jitter, 90.0)  # cap so a single page can't stall forever
+    return min(delay + jitter, 75.0)
