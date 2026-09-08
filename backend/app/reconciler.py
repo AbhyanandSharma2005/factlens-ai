@@ -105,7 +105,8 @@ def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) ->
             rate_limited = is_rate_limit_error(e)
             delay = backoff_delay(attempt, rate_limited)
             reason = "rate limit" if rate_limited else "API error"
-            print(f"⚠️ Reconciler {reason} (attempt {attempt + 1}/{max_retries}). Backing off {delay:.1f}s...")
+            print(f"⚠️ Reconciler {reason} (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+            print(f"   Backing off {delay:.1f}s...")
             time.sleep(delay)
             if attempt == max_retries - 1:
                 return _fallback_result("Failed due to persistent API limits.")
