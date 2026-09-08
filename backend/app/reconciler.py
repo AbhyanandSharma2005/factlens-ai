@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 from dotenv import load_dotenv
 
@@ -30,7 +31,39 @@ ADJUDICATION_SCHEMA = {
     "required": ["relation_type", "explanation", "confidence"]
 }
 
+
+def _normalize(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', (s or "").lower())
+
+
+def is_near_identical(text_a: str, text_b: str) -> bool:
+    """
+    Detects structural duplicates (e.g. a TOC entry and its matching chapter-start
+    heading, or the same sentence re-extracted from an adjacent/overlapping chunk)
+    that aren't genuine cross-document facts worth adjudicating.
+    """
+    norm_a, norm_b = _normalize(text_a), _normalize(text_b)
+    if not norm_a or not norm_b:
+        return False
+    if norm_a == norm_b:
+        return True
+    # one fully contains the other (common with heading vs. heading+number variants)
+    shorter, longer = (norm_a, norm_b) if len(norm_a) <= len(norm_b) else (norm_b, norm_a)
+    if len(shorter) > 8 and shorter in longer:
+        return True
+    return False
+
+
 def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) -> dict:
+    # Guard: skip near-identical evidence text before spending an LLM call —
+    # this is a structural duplicate, not a fact relationship.
+    if is_near_identical(fact1.get("evidence_text", ""), fact2.get("evidence_text", "")):
+        return {
+            "relation_type": "insufficient_evidence",
+            "explanation": "Skipped: evidence text is structurally near-identical (likely a duplicate heading/section reference, not a comparable fact).",
+            "confidence": 0.0
+        }
+
     prompt = f"""You are an expert financial and economic adjudicator.
     Compare these two extracted facts from different documents to see if they relate to each other.
 
@@ -56,7 +89,7 @@ def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) ->
 
     Analyze carefully and provide an explanation.
     """
-    
+
     response = None
     max_retries = 3
     for attempt in range(max_retries):
@@ -76,17 +109,17 @@ def adjudicate_pair(fact1: dict, fact2: dict, doc1_name: str, doc2_name: str) ->
             time.sleep(5)
             if attempt == max_retries - 1:
                 return {
-                    "relation_type": "insufficient_evidence", 
-                    "explanation": "Failed due to persistent API limits.", 
+                    "relation_type": "insufficient_evidence",
+                    "explanation": "Failed due to persistent API limits.",
                     "confidence": 0.0
                 }
-    
+
     try:
         return json.loads(response.text)
     except Exception as e:
         print(f"Adjudication Parsing Error: {e}")
         return {
-            "relation_type": "insufficient_evidence", 
-            "explanation": "Failed to parse LLM response.", 
+            "relation_type": "insufficient_evidence",
+            "explanation": "Failed to parse LLM response.",
             "confidence": 0.0
         }
