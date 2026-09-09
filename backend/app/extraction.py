@@ -48,28 +48,61 @@ class ExtractionResponse(BaseModel):
     facts: List[ExtractedFact] = Field(default_factory=list)
 
 
-def _parse_facts_resilient(raw_content: str, page_num: int) -> List[ExtractedFact]:
+def extract_json_from_response(raw_text: str) -> dict:
     """
-    Validate each fact in the response individually instead of as one batch.
+    Defensive parser: Extracts JSON from raw LLM output, handling markdown 
+    code blocks, conversational text, and minor formatting flaws.
     """
+    if not raw_text:
+        return {"facts": []}
+
+    # 1. Try direct parsing if the model was clean
     try:
-        raw = json.loads(raw_content)
-    except json.JSONDecodeError as e:
-        print(f"❌ Could not parse Groq response on page {page_num} as JSON: {e}")
-        return []
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
 
-    raw_facts = raw.get("facts", []) if isinstance(raw, dict) else []
-    if not isinstance(raw_facts, list):
-        return []
-
-    good_facts = []
-    for i, item in enumerate(raw_facts):
+    # 2. Extract content wrapped in markdown code blocks (```json ... ``` or ``` ... ```)
+    code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
+    if code_block_match:
         try:
-            good_facts.append(ExtractedFact.model_validate(item))
-        except ValidationError as e:
-            print(f"⚠️ Dropping malformed fact #{i} on page {page_num} (kept the rest): {e}")
+            return json.loads(code_block_match.group(1))
+        except json.JSONDecodeError:
+            pass
 
-    return good_facts
+    # 3. Fallback: Find the first opening brace '{' and last closing brace '}'
+    brace_match = re.search(r"(\{.*\})", raw_text, re.DOTALL)
+    if brace_match:
+        try:
+            return json.loads(brace_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # If all parsing strategies fail, return an empty structure safely instead of crashing
+    print(f"⚠️ Failed to parse LLM output as JSON. Raw text was: {raw_text[:100]}...")
+    return {"facts": []}
+
+
+def _parse_facts_resilient(raw_content: str, page_num: int) -> List[ExtractedFact]:
+    # Pass through our defensive parser instead of trusting raw json.loads
+    parsed_data = extract_json_from_response(raw_content)
+    
+    raw_facts_list = parsed_data.get("facts", []) if isinstance(parsed_data, dict) else []
+    if not isinstance(raw_facts_list, list):
+        return []
+
+    valid_facts = []
+
+    for item in raw_facts_list:
+        try:
+            # Validate individual fact schema via Pydantic
+            fact_obj = ExtractedFact.model_validate(item)
+            valid_facts.append(fact_obj)
+        except ValidationError as e:
+            print(f"⚠️ Dropped malformed fact on page {page_num}: {e} | Item: {item}")
+            continue
+
+    return valid_facts
 
 
 def looks_like_toc_or_cover(text: str) -> bool:
@@ -108,17 +141,20 @@ def _normalize_for_match(s: str) -> str:
 def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
     """
     Shared call path: acquires the process-wide rate-limit slot before every
-    request, and applies exponential backoff.
+    request, and applies exponential backoff for transient errors.
     """
     for attempt in range(max_retries):
         try:
             with groq_rate_limiter:
                 response = client.chat.completions.create(
                     model=GROQ_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": "You are a precise data extraction engine. You always output valid JSON representing the requested schema."},
+                        {"role": "user", "content": prompt}
+                    ],
                     temperature=0.0,
                     max_tokens=400,
+                    # REMOVED response_format={"type": "json_object"} to prevent API-level 400 rejections
                 )
             return response
         except Exception as e:
