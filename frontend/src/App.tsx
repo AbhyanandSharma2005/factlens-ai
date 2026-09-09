@@ -26,10 +26,10 @@ export default function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
 
-  // Fetch facts from the FastAPI backend
+  // Fetch facts from the live Render backend
   const fetchFacts = async () => {
     try {
-      const response = await axios.get('http://127.0.0.1:8000/api/facts');
+      const response = await axios.get('https://factlens-ai-km45.onrender.com/api/facts');
       setFacts(response.data);
     } catch (error) {
       console.error("Error fetching facts:", error);
@@ -55,7 +55,7 @@ export default function App() {
     setUploadStatus("Uploading & Analyzing Document...");
 
     try {
-      await axios.post('http://127.0.0.1:8000/api/documents', formData, {
+      await axios.post('https://factlens-ai-km45.onrender.com/api/documents', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
       setUploadStatus("Processing in background. Facts will appear shortly.");
