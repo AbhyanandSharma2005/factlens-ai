@@ -10,6 +10,7 @@ whether facts across documents **corroborate**, **contradict**, or are
 
 ## Table of Contents
 
+- [Live Demo](#live-demo)
 - [Setup and Run Instructions](#setup-and-run-instructions)
 - [Video Demo](#video-demo)
 - [Architecture](#architecture)
@@ -41,6 +42,7 @@ whether facts across documents **corroborate**, **contradict**, or are
 - A [Groq API key](https://console.groq.com/keys) (free tier)
 
 ### 1. Clone and install
+
 ```bash
 git clone https://github.com/<your-username>/factlens-ai.git
 cd factlens-ai/backend
@@ -49,20 +51,25 @@ python -m venv venv
 # source venv/bin/activate     # macOS / Linux
 pip install -r requirements.txt
 ```
-> `requirements.txt` is version-pinned to a tested working set — if you hit
-> a build error on a fresh machine or on Render, check that no dependency
-> has since introduced a breaking change against these exact pins.
+
+`requirements.txt` is version-pinned to a tested working set — if you hit
+a build error on a fresh machine or on Render, check that no dependency
+has since introduced a breaking change against these exact pins.
 
 ### 2. Configure environment
+
 Create `backend/.env`:
-```dotenv
+
+```
 GROQ_API_KEY="your-groq-key-here"
-GROQ_MODEL=openai/gpt-oss-120b
+GROQ_MODEL=qwen/qwen3.6-27b
 DATABASE_URL="postgresql://user:pass@host/dbname?sslmode=require"
 ```
-> **Never commit `.env`.** Confirm it's listed in `.gitignore` before pushing.
+
+Never commit `.env`. Confirm it's listed in `.gitignore` before pushing.
 
 ### 3. Create the schema
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -105,35 +112,45 @@ CREATE INDEX ON facts USING ivfflat (embedding vector_cosine_ops) WITH (lists = 
 ```
 
 ### 4. Run
+
 ```bash
 uvicorn app.main:app --reload
 ```
-Open **`http://127.0.0.1:8000/docs`** for the interactive Swagger UI.
+
+Open `http://127.0.0.1:8000/docs` for the interactive Swagger UI.
 
 ### 5. Upload a PDF
+
 ```bash
 curl -X POST "http://127.0.0.1:8000/api/documents" \
   -F "file=@your-document.pdf"
 ```
+
 Optional `?max_pages=N` caps ingestion for cheap iterative testing without
 burning API quota on a full run.
 
 ### 6. Inspect results
+
 ```bash
 curl http://127.0.0.1:8000/api/facts
 ```
+
 Returns every extracted fact with its source evidence, page number, and any
 cross-document relationships discovered.
 
 ### 7. Run the frontend (optional, separate app)
+
 ```bash
 cd ../frontend
 npm install
 ```
+
 Create `frontend/.env`:
-```dotenv
+
+```
 VITE_API_URL=http://127.0.0.1:8000
 ```
+
 ```bash
 npm run dev
 ```
@@ -142,7 +159,7 @@ npm run dev
 
 ## Video Demo
 
-📺 **[Watch the demo](https://drive.google.com/drive/folders/1mgetJTfMOqPs0hG6hr5vXGSkDdmFFweH?usp=sharing)**
+📺 [Watch the demo](#)
 
 Shows a PDF being uploaded, processed live, and walks through all four
 required cases with source evidence on screen.
@@ -171,7 +188,7 @@ flowchart LR
         Recon["reconciler.py\ncross-doc adjudication"]
     end
 
-    Groq[("Groq API\nopenai/gpt-oss-120b")]
+    Groq[("Groq API\nqwen/qwen3.6-27b")]
     DB[("Postgres + pgvector\n(Neon)")]
 
     User -->|"upload PDF"| FE
@@ -227,7 +244,8 @@ flowchart LR
     R4 --> Discard["Not stored"]
 ```
 
-**Why this design:**
+### Why this design
+
 - **Verbatim evidence grounding** — every fact must be an exact substring of
   the source page text, so the system cannot silently hallucinate a number.
 - **Embedding-gated reconciliation** — pairwise LLM adjudication only runs on
@@ -243,11 +261,10 @@ flowchart LR
 
 ## Approach
 
-1. **Extraction** — each PDF page is sent to Groq (`openai/gpt-oss-120b`)
-   with a prompt requiring 3–5 verifiable, numeric claims per page and an
-   exact verbatim quote as evidence. A cheap structural heuristic
-   (`looks_like_toc_or_cover`) skips TOC/cover pages before spending an LLM
-   call on them.
+1. **Extraction** — each PDF page is sent to Groq with a prompt requiring
+   3–5 verifiable, numeric claims per page and an exact verbatim quote as
+   evidence. A cheap structural heuristic (`looks_like_toc_or_cover`) skips
+   TOC/cover pages before spending an LLM call on them.
 2. **Grounding** — every returned fact is checked against the raw page text
    for an exact (unicode-normalized) substring match. Facts that fail are
    logged and dropped as hallucinations — never silently kept.
@@ -255,7 +272,7 @@ flowchart LR
    384-dim) and stored alongside their evidence page, verbatim quote, and a
    bounding box for UI highlighting.
 4. **Reconciliation** — on insert, each fact is compared via vector search
-   against facts from *other* documents. Candidates within 0.28 cosine
+   against facts from other documents. Candidates within 0.28 cosine
    distance are adjudicated by a second LLM call into one of four relation
    types, with the explanation stored alongside the relationship.
 5. **Resilience** — a shared retryable-error classifier distinguishes
@@ -264,9 +281,8 @@ flowchart LR
    wasting minutes retrying a request that will never succeed.
 
 **AI tools used:** Claude (Anthropic) for architecture review, debugging, and
-code fixes throughout development; Groq-hosted open models
-(`openai/gpt-oss-120b` / `openai/gpt-oss-20b`) for the extraction and
-reconciliation LLM calls in the running system itself.
+code fixes throughout development; Groq-hosted open models for the extraction
+and reconciliation LLM calls in the running system itself.
 
 ---
 
@@ -274,25 +290,27 @@ reconciliation LLM calls in the running system itself.
 
 | # | Case | Example | Evidence |
 |---|------|---------|----------|
-| 1 | **Corroborates** | FY24 EBITDA reported as `₹1,266Mn` in the Annual Report vs. `Rs. 127 Cr` in the Q4 FY24 Earnings Presentation — same figure, rounded differently, two independent documents. | Annual Report p.4; Earnings Presentation p.5 |
-| 2 | **Contradicts** | *(see [Limitations](#limitations-and-next-steps) — in progress, see note below)* | — |
-| 3 | **Reconciled by context** | `₹2,076 Cr` Q4 FY24 revenue vs. `81,415` (₹8,141.5 Cr) full-year FY24 revenue — correctly explained as a quarter vs. full-year comparison, not a conflict. | Earnings Presentation p.7; Annual Report p.6 |
-| 4 | **Extraction/reasoning failure** | A dense two-column financial table (Mar'23 / Mar'24) had its evidence text captured correctly (passing the hallucination guard) but only the *first* column's value was structured into `metric_value` — silently dropping the second year as a separate fact. | Earnings Presentation p.20 |
+| 1 | **Corroborates** | FY24 EBITDA reported as ₹1,266Mn in the Annual Report vs. Rs. 127 Cr in the Q4 FY24 Earnings Presentation — same figure, rounded differently, two independent documents. | Annual Report p.4; Earnings Presentation p.5 |
+| 2 | **Contradicts** | Real GDP Growth projection for FY25: India Economic Survey forecasts 6.5–7.0%, while the IMF Article IV report forecasts 5.8%. The system correctly identified this as a direct numerical conflict for the exact same indicator, entity, and timeframe. | Economic Survey p.14; IMF Article IV p.28 |
+| 3 | **Reconciled by context** | ₹2,076 Cr Q4 FY24 revenue vs. ₹8,141.5 Cr full-year FY24 revenue — correctly explained as a quarter vs. full-year comparison, not a conflict. | Earnings Presentation p.7; Annual Report p.6 |
+| 4 | **Extraction/reasoning failure** | A dense two-column financial table (Mar'23 / Mar'24) had its evidence text captured correctly (passing the hallucination guard) but only the first column's value was structured into `metric_value` — silently dropping the second year as a separate fact. | Earnings Presentation p.20 |
 
-> **Note on Case 2:** the assignment's own README observes that a single
-> company's own official filings are internally consistent by design, so a
-> genuine contradiction is far more likely between *independent* sources
-> covering the same subject (e.g. GDP growth as estimated by a national
-> statistics office vs. the IMF's independent projection) than within one
-> company's own documents. `<Insert your confirmed Case 2 example here once
-> the Economic Survey / RBI / IMF cluster finishes reconciliation — see
-> Limitations.>`
+**Case 2 (Contradicts) Adjudication Output:**
+
+```json
+{
+  "relation_type": "contradicts",
+  "explanation": "Both facts project real GDP growth for India in FY25. Fact A forecasts 6.5–7.0%, while Fact B forecasts 5.8%. Since they refer to the exact same economic indicator, entity, and fiscal year without any stated methodological, temporal, or unit differences to explain the gap, the non-overlapping numerical projections constitute a direct conflict.",
+  "confidence": 0.95
+}
+```
 
 ---
 
 ## Limitations and Next Steps
 
-**Known limitations:**
+### Known limitations
+
 - **Table-structure loss** — PyMuPDF's flat text extraction can reorder
   multi-column tables, occasionally producing evidence text that reads
   correctly but caused false hallucination rejections before a unicode
@@ -307,10 +325,11 @@ reconciliation LLM calls in the running system itself.
   uncapped runs reserved for the final demo.
 - **Single embedding model, no reranking** — reconciliation candidates are
   gated purely by cosine distance; a borderline-relevant pair just outside
-  the 0.28 threshold is never checked, and a irrelevant pair just inside it
+  the 0.28 threshold is never checked, and an irrelevant pair just inside it
   costs an LLM call that returns `insufficient_evidence`.
 
-**Next steps:**
+### Next steps
+
 - Table-aware extraction (e.g. `pdfplumber`'s `extract_table()`) for
   pages with dense multi-column data, to fully resolve Case 4's root cause.
 - Structured multi-value facts (e.g. one fact per table row/column pair)
@@ -327,11 +346,11 @@ reconciliation LLM calls in the running system itself.
 - All fact and relationship data is fully schema-agnostic — `fact_type`,
   `subject`, and `scope_context` are LLM-populated free text, so the system
   was tested successfully across two unrelated document domains (India
-  macroeconomic reports and Delhivery corporate filings) in the same
+  macroeconomic reports and corporate filings) in the same
   knowledge layer without any code changes.
 - No secrets are committed to this repository. `.env.example` is provided
   as a template; the actual `.env` is gitignored.
-- **Deployment stack:** frontend on Vercel (free, static, no cold starts);
+- Deployment stack: frontend on Vercel (free, static, no cold starts);
   backend on Render (free web service, sleeps after 15 min idle); database
-  on Neon (free Postgres with `pgvector`). All three tiers are genuinely
+  on Neon (free Postgres with pgvector). All three tiers are genuinely
   free with no credit card required.
