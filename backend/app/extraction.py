@@ -12,7 +12,8 @@ from groq import Groq
 from pydantic import BaseModel, Field, ValidationError
 from fastembed import TextEmbedding
 
-from app.rate_limiter import groq_rate_limiter, is_rate_limit_error, is_retryable_error, backoff_delay
+from app.rate_limiter import groq_rate_limiter, strict_pacer, is_rate_limit_error, is_retryable_error, backoff_delay
+from app.cache import get_text_hash, check_fact_cache, save_to_fact_cache
 
 print("Loading Embedding Model...")
 embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
@@ -154,7 +155,6 @@ def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
                     ],
                     temperature=0.0,
                     max_tokens=400,
-                    # REMOVED response_format={"type": "json_object"} to prevent API-level 400 rejections
                 )
             return response
         except Exception as e:
@@ -178,45 +178,50 @@ def process_pdf_page(pdf_path: str, page_num: int):
     doc = fitz.open(pdf_path)
     page = doc[page_num - 1]
     
-    # Extract by 'blocks' (paragraphs) to filter individually
+    # 1. Block-level parsing to isolate text paragraphs
     blocks = page.get_text("blocks")
+    filtered_chunks = []
     
-    filtered_text_chunks = []
     for b in blocks:
         block_text = b[4].strip()
-        
-        # Zero-Token Guardrail: If a paragraph lacks digits, drop it to save tokens
+        # Heuristic: If a paragraph has no numbers or is too short, discard it locally (0 tokens)
         if re.search(r'\d', block_text) and len(block_text) > 20:
-            filtered_text_chunks.append(block_text)
+            filtered_chunks.append(block_text)
             
-    filtered_text = "\n\n".join(filtered_text_chunks)
+    filtered_text = "\n\n".join(filtered_chunks)
 
-    # Skip LLM call if negligible numeric content remains or it looks like TOC/cover
+    # Skip empty or cover-like pages locally
     if len(filtered_text) < 100 or looks_like_toc_or_cover(filtered_text):
-        print(f"⏭️  Skipping page {page_num} (No numeric data or looks like TOC/cover)")
+        print(f"⏭️ Skipping page {page_num} locally (No numeric data/TOC)")
         return []
 
-    # Optimized Minimized Prompt
+    # 2. Check Content-Addressable Cache (0 API calls if text was processed before)
+    text_hash = get_text_hash(filtered_text)
+    cached_result = check_fact_cache(text_hash)
+    if cached_result is not None:
+        print(f"⚡ Cache hit for page {page_num}! Skipping LLM call.")
+        return cached_result
+
+    # 3. Proactive Rate Limiting (Pace requests mathematically)
+    strict_pacer.acquire()
+
     prompt = f"""Extract 1 to 4 verifiable quantitative facts from this text. 
 A valid fact MUST contain a specific number, statistic, percentage, or date.
-Do NOT extract general text, chapter titles, or boilerplate.
-The evidence_text MUST be an exact, word-for-word substring from the text below.
-
-Respond ONLY with a JSON object of this exact shape:
+Respond ONLY with a JSON object:
 {{
   "facts": [
     {{
       "subject": "string",
-      "fact_type": "string (e.g. Financial, Macroeconomic)",
-      "metric_value": {{"raw_value": "exact number string"}},
-      "scope_context": {{"period": "e.g. FY24 or null"}},
+      "fact_type": "string",
+      "metric_value": {{"raw_value": "string"}},
+      "scope_context": {{"period": "string or null"}},
       "evidence_text": "exact verbatim quote",
       "confidence": 0.9
     }}
   ]
 }}
 
-PAGE TEXT:{filtered_text}
+TEXT:{filtered_text}
 """
 
     response = _call_groq_with_backoff(prompt)
@@ -229,8 +234,6 @@ PAGE TEXT:{filtered_text}
     facts = _parse_facts_resilient(raw_content, page_num)
 
     verified_facts = []
-    
-    # Use full original page text for verbatim hallucination matching
     raw_page_text = page.get_text("text")
 
     for item in facts:
@@ -263,5 +266,9 @@ PAGE TEXT:{filtered_text}
             "evidence_page": page_num,
             "embedding": vector,
         })
+
+    # 4. Save successful extraction to cache for future runs
+    if verified_facts:
+        save_to_fact_cache(text_hash, verified_facts)
 
     return verified_facts
