@@ -4,8 +4,6 @@ Extracts grounded, evidence-linked facts from PDFs and automatically determines
 whether facts across documents **corroborate**, **contradict**, or are
 **reconciled by context** (different time periods, units, or methodology).
 
-> Built for the Superjoin VIT 2026 Engineering Intern assignment.
-
 ---
 
 ## Table of Contents
