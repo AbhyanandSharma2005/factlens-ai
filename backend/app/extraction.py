@@ -147,7 +147,7 @@ def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
                     # "max completion tokens reached before generating a valid
                     # document"). Set an explicit, generous ceiling instead of
                     # relying on the model/provider default.
-                    max_tokens=4096,
+                    max_tokens=400,
                 )
             return response
         except Exception as e:
