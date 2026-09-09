@@ -1,29 +1,31 @@
 ﻿import json
 from app.reconciler import adjudicate_pair
 
+# Fact A: India Economic Survey 2024-25 baseline projection
 fact_survey = {
-    "evidence_page": 15,
-    "subject": "services sector growth",
+    "evidence_page": 14,
+    "subject": "Real GDP Growth FY25",
     "fact_type": "Macroeconomic",
-    "metric_value": {"raw_value": "7.2 per cent"},
+    "metric_value": {"raw_value": "6.5% to 7.0%"},
     "scope_context": {"period": "FY25"},
-    "evidence_text": "Growth in the services sector is expected to remain robust at 7.2 per cent",
+    "evidence_text": "The Survey conservatively projects real GDP growth of 6.5–7.0 per cent in FY25.",
 }
 
-fact_rbi = {
-    "evidence_page": 9,
-    "subject": "Services sector growth",
+# Fact B: A direct conflicting macroeconomic assessment
+fact_imf = {
+    "evidence_page": 28,
+    "subject": "Real GDP Growth FY25",
     "fact_type": "Macroeconomic",
-    "metric_value": {"raw_value": "7.5 per cent"},
-    "scope_context": {"period": "2024-25"},
-    "evidence_text": "services sector, with a share of 64.1 per cent in GVA, remained the mainstay of aggregate supply with a growth of 7.5 per cent in 2024-25.",
+    "metric_value": {"raw_value": "5.8%"},
+    "scope_context": {"period": "FY25"},
+    "evidence_text": "Real GDP growth for the Indian economy in FY25 is projected to decelerate sharply to 5.8 per cent.",
 }
 
 result = adjudicate_pair(
     fact1=fact_survey,
-    fact2=fact_rbi,
+    fact2=fact_imf,
     doc1_name="01-india-economic-survey-2024-25-excerpt.pdf",
-    doc2_name="02-rbi-annual-report-2024-25-excerpt.pdf",
+    doc2_name="03-imf-article-iv-consultation.pdf",
 )
 
 print(json.dumps(result, indent=2))
