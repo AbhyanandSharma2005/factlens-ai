@@ -40,7 +40,7 @@ class RateLimiter:
 
 
 # Single shared instance imported by both extraction.py and reconciler.py.
-groq_rate_limiter = RateLimiter(min_interval_seconds=2.2, max_concurrent=1)
+groq_rate_limiter = RateLimiter(min_interval_seconds=15.0, max_concurrent=1)
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
