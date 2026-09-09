@@ -26,10 +26,6 @@ client = Groq(api_key=api_key)
 
 
 # --- Pydantic validation layer -------------------------------------------------
-# Groq's JSON mode guarantees valid JSON, not your exact structure. This is the
-# schema-enforcement Gemini's response_schema gave you for free — anything that
-# doesn't match gets rejected here, before it ever reaches the evidence/quantifiable
-# content checks below.
 
 class MetricValue(BaseModel):
     raw_value: str
@@ -55,13 +51,6 @@ class ExtractionResponse(BaseModel):
 def _parse_facts_resilient(raw_content: str, page_num: int) -> List[ExtractedFact]:
     """
     Validate each fact in the response individually instead of as one batch.
-
-    Groq's JSON mode guarantees syntactically valid JSON, but not that every
-    item matches our schema. Validating the whole `facts` list as a single
-    Pydantic model means one malformed item (e.g. a missing evidence_text)
-    throws out every other -- otherwise valid -- fact on the page. Since a
-    page can easily produce 3-5 facts, that's real extracted data lost over
-    one bad item. This validates fact-by-fact and keeps the good ones.
     """
     try:
         raw = json.loads(raw_content)
@@ -104,21 +93,13 @@ def has_quantifiable_content(item: ExtractedFact) -> bool:
 def _normalize_for_match(s: str) -> str:
     """
     Normalize text before the verbatim-substring hallucination check.
-
-    PyMuPDF's extracted text and the LLM's JSON output can differ in ways that
-    are semantically identical but byte-different: curly vs straight quotes,
-    en/em dashes vs hyphens, non-breaking spaces. Without this, a single
-    mismatched character anywhere in the quote fails the whole substring
-    match and produces a false "hallucination" rejection on text the model
-    actually copied correctly. Whitespace is still collapsed at the end so
-    line-wrap differences don't matter either.
     """
     if not s:
         return ""
     s = s.replace('\u2018', "'").replace('\u2019', "'")   # curly single quotes
     s = s.replace('\u201c', '"').replace('\u201d', '"')   # curly double quotes
     s = s.replace('\u2013', '-').replace('\u2014', '-')   # en dash / em dash
-    s = s.replace('\u00a0', ' ')                            # non-breaking space
+    s = s.replace('\u00a0', ' ')                          # non-breaking space
     s = s.replace('\ufb01', 'fi').replace('\ufb02', 'fl')  # common ligatures
     s = re.sub(r'\s+', ' ', s)
     return s.strip()
@@ -127,12 +108,7 @@ def _normalize_for_match(s: str) -> str:
 def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
     """
     Shared call path: acquires the process-wide rate-limit slot before every
-    request, and applies exponential backoff (longer specifically for 429s).
-
-    Only retries errors classified as retryable (rate limits, transient
-    server/network issues). Deterministic failures like a 400
-    json_validate_failed fail immediately instead of replaying the same
-    failure 5 times at exponential backoff cost.
+    request, and applies exponential backoff.
     """
     for attempt in range(max_retries):
         try:
@@ -142,11 +118,6 @@ def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
                     messages=[{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"},
                     temperature=0.0,
-                    # Dense table-heavy pages can produce enough facts that the
-                    # response gets cut off mid-JSON before it's valid (seen as
-                    # "max completion tokens reached before generating a valid
-                    # document"). Set an explicit, generous ceiling instead of
-                    # relying on the model/provider default.
                     max_tokens=400,
                 )
             return response
@@ -170,52 +141,46 @@ def _call_groq_with_backoff(prompt: str, max_retries: int = 5):
 def process_pdf_page(pdf_path: str, page_num: int):
     doc = fitz.open(pdf_path)
     page = doc[page_num - 1]
-    text = page.get_text("text")
+    
+    # Extract by 'blocks' (paragraphs) to filter individually
+    blocks = page.get_text("blocks")
+    
+    filtered_text_chunks = []
+    for b in blocks:
+        block_text = b[4].strip()
+        
+        # Zero-Token Guardrail: If a paragraph lacks digits, drop it to save tokens
+        if re.search(r'\d', block_text) and len(block_text) > 20:
+            filtered_text_chunks.append(block_text)
+            
+    filtered_text = "\n\n".join(filtered_text_chunks)
 
-    if len(text.strip()) < 100:
+    # Skip LLM call if negligible numeric content remains or it looks like TOC/cover
+    if len(filtered_text) < 100 or looks_like_toc_or_cover(filtered_text):
+        print(f"⏭️  Skipping page {page_num} (No numeric data or looks like TOC/cover)")
         return []
 
-    if looks_like_toc_or_cover(text):
-        print(f"⏭️  Skipping page {page_num} (looks like TOC/cover, no LLM call made)")
-        return []
-
-    # Groq's json_object mode requires the word "JSON" to appear in the prompt,
-    # and expects a top-level object (not a bare array) — hence the "facts" wrapper.
-    prompt = f"""Extract 3 to 5 verifiable factual claims from this page. A valid fact MUST
-contain a specific number, statistic, percentage, date, or a named quantitative comparison.
-
-Do NOT extract:
-- Chapter titles, section headings, or table of contents entries
-- General descriptive or motivational sentences with no data (e.g. slide taglines)
-- Page numbers, headers, footers, or boilerplate/disclaimer text
-
-GOOD fact example: "India's CPI inflation eased to 4.9% in FY25 from 5.4% in FY24"
-GOOD fact example: "The current account deficit narrowed to 0.6% of GDP in Q3 FY25"
-BAD (reject) example: "Chapter 3: External Sector" — this is a heading, not a claim
-BAD (reject) example: "Domestic Economy Remains Steady Amidst Global Uncertainties" — this is
-  a section title/summary line with no quantifiable content
-
-If this page is a table of contents, cover page, divider, or otherwise contains no facts
-meeting the above bar, return an empty facts array.
-
-The evidence_text MUST be an exact, word-for-word substring from the text below. Do not paraphrase.
+    # Optimized Minimized Prompt
+    prompt = f"""Extract 1 to 4 verifiable quantitative facts from this text. 
+A valid fact MUST contain a specific number, statistic, percentage, or date.
+Do NOT extract general text, chapter titles, or boilerplate.
+The evidence_text MUST be an exact, word-for-word substring from the text below.
 
 Respond ONLY with a JSON object of this exact shape:
 {{
   "facts": [
     {{
       "subject": "string",
-      "fact_type": "string, e.g. Financial, Macroeconomic, Operational",
-      "metric_value": {{"raw_value": "the exact number or metric as a string"}},
-      "scope_context": {{"period": "e.g. FY24, Q1 2023, or null"}},
-      "evidence_text": "exact verbatim quote from the page text",
-      "confidence": 0.0
+      "fact_type": "string (e.g. Financial, Macroeconomic)",
+      "metric_value": {{"raw_value": "exact number string"}},
+      "scope_context": {{"period": "e.g. FY24 or null"}},
+      "evidence_text": "exact verbatim quote",
+      "confidence": 0.9
     }}
   ]
 }}
 
-PAGE TEXT:
-{text}
+PAGE TEXT:{filtered_text}
 """
 
     response = _call_groq_with_backoff(prompt)
@@ -228,18 +193,21 @@ PAGE TEXT:
     facts = _parse_facts_resilient(raw_content, page_num)
 
     verified_facts = []
+    
+    # Use full original page text for verbatim hallucination matching
+    raw_page_text = page.get_text("text")
 
     for item in facts:
         ev_text = item.evidence_text.strip()
         clean_ev = _normalize_for_match(ev_text)
-        clean_doc = _normalize_for_match(text)
+        clean_doc = _normalize_for_match(raw_page_text)
 
         if not clean_ev or clean_ev not in clean_doc:
-            print(f"❌ REJECTED (hallucination — evidence not found verbatim): {ev_text[:50]}...")
+            print(f"❌ REJECTED (hallucination): {ev_text[:50]}...")
             continue
 
         if not has_quantifiable_content(item):
-            print(f"❌ REJECTED (no quantifiable content — likely a heading/title): {ev_text[:50]}...")
+            print(f"❌ REJECTED (no quantifiable content): {ev_text[:50]}...")
             continue
 
         rects = page.search_for(ev_text[:50])
